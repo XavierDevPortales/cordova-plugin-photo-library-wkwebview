@@ -1,7 +1,8 @@
 import Photos
 import Foundation
-import AssetsLibrary // TODO: needed for deprecated functionality
 import MobileCoreServices
+import UIKit
+import AVFoundation
 
 extension PHAsset {
 
@@ -515,37 +516,86 @@ final class PhotoLibraryService {
 
         let assetsLibrary = ALAssetsLibrary()
 
-        func saveImage(_ photoAlbum: PHAssetCollection) {
-            assetsLibrary.writeImageData(toSavedPhotosAlbum: sourceData, metadata: nil) { (assetUrl: URL?, error: Error?) in
+func saveImage(_ url: String, album: String, completion: @escaping (_ libraryItem: NSDictionary?, _ error: String?)->Void) {
 
-                if error != nil {
-                    completion(nil, "Could not write image to album: \(error)")
-                    return
-                }
+    let sourceData: Data
+    do {
+        sourceData = try getDataFromURL(url)
+    } catch {
+        completion(nil, "\(error)")
+        return
+    }
 
-                guard let assetUrl = assetUrl else {
-                    completion(nil, "Writing image to album resulted empty asset")
-                    return
-                }
+    func saveImageToAlbum(_ photoAlbum: PHAssetCollection) {
 
-                self.putMediaToAlbum(assetsLibrary, url: assetUrl, album: album, completion: { (error) in
-                    if error != nil {
-                        completion(nil, error)
-                    } else {
-                        let fetchResult = PHAsset.fetchAssets(withALAssetURLs: [assetUrl], options: nil)
-                        var libraryItem: NSDictionary? = nil
-                        if fetchResult.count == 1 {
-                            let asset = fetchResult.firstObject
-                            if let asset = asset {
-                                libraryItem = self.assetToLibraryItem(asset: asset, useOriginalFileNames: false, includeAlbumData: true)
-                            }
-                        }
-                        completion(libraryItem, nil)
-                    }
-                })
+        var createdAssetLocalIdentifier: String?
 
+        PHPhotoLibrary.shared().performChanges({
+
+            let creationRequest = PHAssetCreationRequest.forAsset()
+            let options = self.photoResourceCreationOptions(for: url)
+
+            creationRequest.addResource(with: .photo, data: sourceData, options: options)
+
+            guard let placeholder = creationRequest.placeholderForCreatedAsset else {
+                return
             }
+
+            createdAssetLocalIdentifier = placeholder.localIdentifier
+
+            if let albumChangeRequest = PHAssetCollectionChangeRequest(for: photoAlbum) {
+                albumChangeRequest.addAssets([placeholder] as NSArray)
+            }
+
+        }) { success, error in
+
+            if let error = error {
+                completion(nil, "Could not write image to album: \(error.localizedDescription)")
+                return
+            }
+
+            if !success {
+                completion(nil, "Could not write image to album")
+                return
+            }
+
+            guard let localIdentifier = createdAssetLocalIdentifier else {
+                completion(nil, "Created asset identifier is nil")
+                return
+            }
+
+            let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [localIdentifier], options: nil)
+
+            guard let asset = fetchResult.firstObject else {
+                completion(nil, "Could not fetch created asset")
+                return
+            }
+
+            let libraryItem = self.assetToLibraryItem(
+                asset: asset,
+                useOriginalFileNames: false,
+                includeAlbumData: true
+            )
+
+            completion(libraryItem, nil)
         }
+    }
+
+    if let photoAlbum = PhotoLibraryService.getPhotoAlbum(album) {
+        saveImageToAlbum(photoAlbum)
+        return
+    }
+
+    PhotoLibraryService.createPhotoAlbum(album) { (photoAlbum: PHAssetCollection?, error: String?) in
+
+        guard let photoAlbum = photoAlbum else {
+            completion(nil, error)
+            return
+        }
+
+        saveImageToAlbum(photoAlbum)
+    }
+}
 
         if let photoAlbum = PhotoLibraryService.getPhotoAlbum(album) {
             saveImage(photoAlbum)
@@ -686,33 +736,51 @@ final class PhotoLibraryService {
         }
     }
 
-    fileprivate func putMediaToAlbum(_ assetsLibrary: ALAssetsLibrary, url: URL, album: String, completion: @escaping (_ error: String?)->Void) {
+  fileprivate func photoResourceCreationOptions(for url: String) -> PHAssetResourceCreationOptions {
 
-        assetsLibrary.asset(for: url, resultBlock: { (asset: ALAsset?) in
+    let options = PHAssetResourceCreationOptions()
+    let lowerUrl = url.lowercased()
 
-            guard let asset = asset else {
-                completion("Retrieved asset is nil")
-                return
-            }
-
-            PhotoLibraryService.getAlPhotoAlbum(assetsLibrary, album: album, completion: { (alPhotoAlbum: ALAssetsGroup?, error: String?) in
-
-                if error != nil {
-                    completion("getting photo album caused error: \(error)")
-                    return
-                }
-
-                alPhotoAlbum!.add(asset)
-                completion(nil)
-
-            })
-
-        }, failureBlock: { (error: Error?) in
-            completion("Could not retrieve saved asset: \(error)")
-        })
-
+    if lowerUrl.hasPrefix("data:image/gif") {
+        options.originalFilename = "image.gif"
+        options.uniformTypeIdentifier = kUTTypeGIF as String
+        return options
     }
 
+    if lowerUrl.hasPrefix("data:image/png") {
+        options.originalFilename = "image.png"
+        options.uniformTypeIdentifier = kUTTypePNG as String
+        return options
+    }
+
+    if lowerUrl.hasPrefix("data:image/jpeg") || lowerUrl.hasPrefix("data:image/jpg") {
+        options.originalFilename = "image.jpg"
+        options.uniformTypeIdentifier = kUTTypeJPEG as String
+        return options
+    }
+
+    if let parsedURL = URL(string: url), !parsedURL.lastPathComponent.isEmpty {
+        options.originalFilename = parsedURL.lastPathComponent
+
+        switch parsedURL.pathExtension.lowercased() {
+        case "gif":
+            options.uniformTypeIdentifier = kUTTypeGIF as String
+        case "png":
+            options.uniformTypeIdentifier = kUTTypePNG as String
+        case "jpg", "jpeg":
+            options.uniformTypeIdentifier = kUTTypeJPEG as String
+        default:
+            break
+        }
+
+        return options
+    }
+
+    options.originalFilename = "image.jpg"
+    options.uniformTypeIdentifier = kUTTypeJPEG as String
+    return options
+}
+  
     fileprivate static func image2PictureData(_ image: UIImage, quality: Float) -> PictureData? {
         //        This returns raw data, but mime type is unknown. Anyway, crodova performs base64 for messageAsArrayBuffer, so there's no performance gain visible
         //        let provider: CGDataProvider = CGImageGetDataProvider(image.CGImage)!
@@ -785,30 +853,4 @@ final class PhotoLibraryService {
             }
         }
     }
-
-    fileprivate static func getAlPhotoAlbum(_ assetsLibrary: ALAssetsLibrary, album: String, completion: @escaping (_ alPhotoAlbum: ALAssetsGroup?, _ error: String?)->Void) {
-
-        var groupPlaceHolder: ALAssetsGroup?
-
-        assetsLibrary.enumerateGroupsWithTypes(ALAssetsGroupAlbum, usingBlock: { (group: ALAssetsGroup?, _ ) in
-
-            guard let group = group else { // done enumerating
-                guard let groupPlaceHolder = groupPlaceHolder else {
-                    completion(nil, "Could not find album")
-                    return
-                }
-                completion(groupPlaceHolder, nil)
-                return
-            }
-
-            if group.value(forProperty: ALAssetsGroupPropertyName) as? String == album {
-                groupPlaceHolder = group
-            }
-
-        }, failureBlock: { (error: Error?) in
-            completion(nil, "Could not enumerate assets library")
-        })
-
-    }
-
 }
